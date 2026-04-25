@@ -3,3 +3,5 @@
 __pycache__/
 *.pyc
 booking.log
+.direnv/
+.venv/
