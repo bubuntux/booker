@@ -226,8 +226,10 @@ def run() -> int:
 
         try:
             log("Navigating to booking page...")
-            page.goto(booking_url, wait_until="networkidle", timeout=30000)
+            page.goto(booking_url, wait_until="domcontentloaded", timeout=30000)
             human_delay(1.0, 2.0)
+
+            _dismiss_cookie_banner(page)
 
             # Wait for form fields to appear
             log("Waiting for booking form...")
@@ -321,6 +323,30 @@ def run() -> int:
         finally:
             context.close()
             browser.close()
+
+
+def _dismiss_cookie_banner(page) -> None:
+    """Best-effort: click an Accept/Allow cookie button if present. Never raises."""
+    selectors = [
+        "button#onetrust-accept-btn-handler",
+        "button:has-text('I understand')",
+        "button:has-text('Accept all')",
+        "button:has-text('Accept All')",
+        "button:has-text('Accept')",
+        "button:has-text('Allow all')",
+        "button:has-text('Got it')",
+        "button:has-text('I agree')",
+    ]
+    for selector in selectors:
+        try:
+            btn = page.locator(selector).first
+            if btn.is_visible(timeout=1500):
+                log(f"Dismissing cookie banner via {selector!r}")
+                btn.click()
+                human_delay(0.5, 1.0)
+                return
+        except Exception:
+            continue
 
 
 def _find_submit_button(page):
