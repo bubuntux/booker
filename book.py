@@ -227,9 +227,27 @@ def run() -> int:
         try:
             log("Navigating to booking page...")
             page.goto(booking_url, wait_until="domcontentloaded", timeout=30000)
-            human_delay(1.0, 2.0)
+            # Calendly is a React SPA — `load` fires before the form renders.
+            # Wait for *something* meaningful (cookie button or a form input) so
+            # we don't screenshot a blank canvas.
+            try:
+                page.wait_for_selector(
+                    ", ".join(COOKIE_BUTTON_SELECTORS) + ", input:visible, textarea:visible",
+                    timeout=15000,
+                )
+            except Exception:
+                log("Timed out waiting for SPA content; proceeding anyway")
+            human_delay(0.5, 1.0)
+
+            shot = run_dir / "01_before_cookie_dismiss.png"
+            page.screenshot(path=str(shot), full_page=True)
+            log(f"Screenshot saved: {shot}")
 
             _dismiss_cookie_banner(page)
+
+            shot = run_dir / "02_after_cookie_dismiss.png"
+            page.screenshot(path=str(shot), full_page=True)
+            log(f"Screenshot saved: {shot}")
 
             # Wait for form fields to appear
             log("Waiting for booking form...")
@@ -239,9 +257,11 @@ def run() -> int:
             )
             human_delay(1.0, 2.0)
 
-            # Take a screenshot for debugging
-            shot = run_dir / "before_fill.png"
-            page.screenshot(path=str(shot))
+            # Banner can appear late; retry once now that the form is present.
+            _dismiss_cookie_banner(page, total_timeout_ms=2000)
+
+            shot = run_dir / "03_before_fill.png"
+            page.screenshot(path=str(shot), full_page=True)
             log(f"Screenshot saved: {shot}")
 
             # Fill in the form fields
@@ -251,7 +271,7 @@ def run() -> int:
             if not filled:
                 log("WARNING: No form fields matched. Available labels on page:")
                 _debug_form_fields(page)
-                page.screenshot(path=str(run_dir / "no_match.png"))
+                page.screenshot(path=str(run_dir / "no_match.png"), full_page=True)
                 return 1
 
             log(f"Filled {len(filled)}/{len(fields)} fields: {filled}")
@@ -262,7 +282,7 @@ def run() -> int:
                 _debug_form_fields(page)
 
             human_delay(1.0, 2.0)
-            page.screenshot(path=str(run_dir / "after_fill.png"))
+            page.screenshot(path=str(run_dir / "04_after_fill.png"), full_page=True)
 
             # DRY RUN: submit disabled so you can verify field population.
             log("DRY RUN: skipping submit. Verify the filled form, then re-enable.")
@@ -276,8 +296,8 @@ def run() -> int:
                 submit_button.scroll_into_view_if_needed()
                 submit_button.evaluate("el => el.style.outline = '4px solid #ff3b3b'")
             human_delay(2.0, 4.0)
-            shot = run_dir / "dry_run.png"
-            page.screenshot(path=str(shot))
+            shot = run_dir / "05_dry_run.png"
+            page.screenshot(path=str(shot), full_page=True)
             log(f"Screenshot saved: {shot}")
             return 0
 
@@ -314,7 +334,7 @@ def run() -> int:
             log(f"ERROR: {e}")
             try:
                 shot = run_dir / "error.png"
-                page.screenshot(path=str(shot))
+                page.screenshot(path=str(shot), full_page=True)
                 log(f"Error screenshot saved: {shot}")
             except Exception:
                 pass
@@ -325,28 +345,51 @@ def run() -> int:
             browser.close()
 
 
-def _dismiss_cookie_banner(page) -> None:
-    """Best-effort: click an Accept/Allow cookie button if present. Never raises."""
-    selectors = [
-        "button#onetrust-accept-btn-handler",
-        "button:has-text('I understand')",
-        "button:has-text('Accept all')",
-        "button:has-text('Accept All')",
-        "button:has-text('Accept')",
-        "button:has-text('Allow all')",
-        "button:has-text('Got it')",
-        "button:has-text('I agree')",
-    ]
-    for selector in selectors:
-        try:
-            btn = page.locator(selector).first
-            if btn.is_visible(timeout=1500):
-                log(f"Dismissing cookie banner via {selector!r}")
-                btn.click()
-                human_delay(0.5, 1.0)
-                return
-        except Exception:
-            continue
+COOKIE_BUTTON_SELECTORS = [
+    "button#onetrust-accept-btn-handler",
+    "button:has-text('I understand')",
+    "button:has-text('Accept all')",
+    "button:has-text('Accept All')",
+    "button:has-text('Accept')",
+    "button:has-text('Allow all')",
+    "button:has-text('Got it')",
+    "button:has-text('I agree')",
+]
+
+
+def _dismiss_cookie_banner(page, total_timeout_ms: int = 8000) -> bool:
+    """Best-effort: click an Accept/Allow cookie button if present. Never raises.
+
+    The banner is injected asynchronously, so we poll up to total_timeout_ms.
+    Returns True if a button was clicked.
+    """
+    deadline = time.monotonic() + total_timeout_ms / 1000
+    while time.monotonic() < deadline:
+        for selector in COOKIE_BUTTON_SELECTORS:
+            try:
+                btn = page.locator(selector).first
+                if btn.is_visible(timeout=500):
+                    log(f"Dismissing cookie banner via {selector!r}")
+                    btn.click()
+                    # Wait for the banner to actually go away so the next
+                    # screenshot doesn't capture a transient re-render.
+                    try:
+                        page.locator(selector).first.wait_for(
+                            state="hidden", timeout=5000
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        page.wait_for_load_state("load", timeout=5000)
+                    except Exception:
+                        pass
+                    human_delay(0.8, 1.5)
+                    return True
+            except Exception:
+                continue
+        time.sleep(0.3)
+    log("No cookie banner detected within timeout")
+    return False
 
 
 def _find_submit_button(page):
