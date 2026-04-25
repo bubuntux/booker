@@ -1,5 +1,6 @@
 .env
 *.png
+screenshots/
 __pycache__/
 *.pyc
 booking.log

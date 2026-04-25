@@ -3,12 +3,16 @@
 
 import os
 import random
+import re
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+
+SCREENSHOT_ROOT = Path(__file__).parent / "screenshots"
 
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
+from playwright_stealth import Stealth
 
 
 def log(msg: str) -> None:
@@ -36,14 +40,42 @@ def human_delay(lo: float = 0.3, hi: float = 1.0) -> None:
     time.sleep(random.uniform(lo, hi))
 
 
+def _normalize(s: str) -> str:
+    """Lowercase, drop required-marker `*`, collapse non-alphanumerics to single spaces."""
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+def _tokens(s: str) -> set[str]:
+    return set(_normalize(s).split())
+
+
+def _score(field_key: str, label_text: str) -> int:
+    """Higher = better match. 0 means no match.
+
+    Substring matches beat token overlap; more shared tokens beats fewer.
+    """
+    key_norm = _normalize(field_key)
+    label_norm = _normalize(label_text)
+    if not key_norm or not label_norm:
+        return 0
+    if key_norm == label_norm:
+        return 1000
+    if key_norm in label_norm or label_norm in key_norm:
+        # Score by length of the contained string so "phone number" beats "phone".
+        return 500 + min(len(key_norm), len(label_norm))
+    overlap = _tokens(field_key) & _tokens(label_text)
+    return len(overlap)
+
+
 def match_and_fill(page, fields: dict[str, str]) -> list[str]:
     """Find form fields on the page and fill them based on BOOKING_* env vars.
 
-    Returns list of field labels that were successfully filled.
+    For each form element, picks the highest-scoring unfilled field, so e.g.
+    "Phone Number" gets BOOKING_PHONE_NUMBER even though "House Number and Street"
+    also shares the token "number".
     """
-    filled = []
+    filled: list[str] = []
 
-    # Gather all visible input/textarea/select elements
     form_elements = page.query_selector_all(
         "input:visible, textarea:visible, select:visible"
     )
@@ -53,30 +85,32 @@ def match_and_fill(page, fields: dict[str, str]) -> list[str]:
         if input_type in ("hidden", "submit", "button", "checkbox", "radio"):
             continue
 
-        # Try to determine the field's label text
         label_text = _get_label_for_element(page, element)
         if not label_text:
             continue
 
-        label_lower = label_text.lower()
+        # Pick best unfilled field for this label.
+        candidates = [
+            (_score(k, label_text), k, v)
+            for k, v in fields.items()
+            if k not in filled
+        ]
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        if not candidates or candidates[0][0] <= 0:
+            continue
 
-        # Match against collected BOOKING_* fields
-        for field_key, field_value in fields.items():
-            if field_key in label_lower or label_lower in field_key:
-                if field_key not in [f.lower() for f in filled]:
-                    log(f"  Filling '{label_text}' with BOOKING_{field_key.upper().replace(' ', '_')}")
-                    tag = element.evaluate("el => el.tagName.toLowerCase()")
-                    if tag == "select":
-                        element.select_option(label=field_value)
-                    else:
-                        # Use the Playwright locator API for typing
-                        element.click()
-                        human_delay(0.2, 0.5)
-                        element.fill("")
-                        page.keyboard.type(field_value, delay=random.randint(30, 120))
-                    filled.append(field_key)
-                    human_delay(0.5, 1.2)
-                break
+        _, field_key, field_value = candidates[0]
+        log(f"  Filling '{label_text.strip()}' with BOOKING_{field_key.upper().replace(' ', '_')}")
+        tag = element.evaluate("el => el.tagName.toLowerCase()")
+        if tag == "select":
+            element.select_option(label=field_value)
+        else:
+            element.click()
+            human_delay(0.2, 0.5)
+            element.fill("")
+            page.keyboard.type(field_value, delay=random.randint(30, 120))
+        filled.append(field_key)
+        human_delay(0.5, 1.2)
 
     return filled
 
@@ -163,9 +197,13 @@ def run() -> int:
     headless = os.environ.get("HEADLESS", "true").lower() != "false"
     fields = collect_booking_fields()
 
+    run_dir = SCREENSHOT_ROOT / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
     log(f"Booking URL: {booking_url}")
     log(f"Headless: {headless}")
     log(f"Fields to fill: {list(fields.keys())}")
+    log(f"Screenshots: {run_dir}")
 
     if not fields:
         log("ERROR: No BOOKING_* form field env vars found (need at least BOOKING_NAME, BOOKING_EMAIL, etc.)")
@@ -184,7 +222,7 @@ def run() -> int:
             locale="en-US",
         )
         page = context.new_page()
-        stealth_sync(page)
+        Stealth().apply_stealth_sync(page)
 
         try:
             log("Navigating to booking page...")
@@ -200,8 +238,9 @@ def run() -> int:
             human_delay(1.0, 2.0)
 
             # Take a screenshot for debugging
-            page.screenshot(path="/tmp/before_fill.png")
-            log("Screenshot saved: /tmp/before_fill.png")
+            shot = run_dir / "before_fill.png"
+            page.screenshot(path=str(shot))
+            log(f"Screenshot saved: {shot}")
 
             # Fill in the form fields
             log("Filling form fields...")
@@ -210,53 +249,71 @@ def run() -> int:
             if not filled:
                 log("WARNING: No form fields matched. Available labels on page:")
                 _debug_form_fields(page)
-                page.screenshot(path="/tmp/no_match.png")
+                page.screenshot(path=str(run_dir / "no_match.png"))
                 return 1
 
             log(f"Filled {len(filled)}/{len(fields)} fields: {filled}")
             unfilled = set(fields.keys()) - set(filled)
             if unfilled:
                 log(f"WARNING: Unfilled fields: {list(unfilled)}")
+                log("Available labels on page (rename your BOOKING_* vars to overlap):")
+                _debug_form_fields(page)
 
             human_delay(1.0, 2.0)
-            page.screenshot(path="/tmp/after_fill.png")
+            page.screenshot(path=str(run_dir / "after_fill.png"))
 
-            # Click submit button
-            log("Submitting booking...")
+            # DRY RUN: submit disabled so you can verify field population.
+            log("DRY RUN: skipping submit. Verify the filled form, then re-enable.")
             submit_button = _find_submit_button(page)
             if not submit_button:
-                log("ERROR: Could not find submit button")
-                page.screenshot(path="/tmp/no_submit.png")
-                return 1
-
-            submit_button.click()
-            log("Submit clicked, waiting for confirmation...")
-
-            # Wait for confirmation
-            try:
-                page.wait_for_selector(
-                    "text=confirmed, text=scheduled, text=You are scheduled",
-                    timeout=15000,
-                )
-                log("SUCCESS: Booking confirmed!")
-            except Exception:
-                # Check if URL changed to a confirmation page
-                human_delay(3.0, 5.0)
-                if "invitees" in page.url or "confirmed" in page.url.lower():
-                    log("SUCCESS: Redirected to confirmation page")
-                else:
-                    log(f"WARNING: Uncertain confirmation. Current URL: {page.url}")
-                    page.screenshot(path="/tmp/uncertain.png")
-
-            page.screenshot(path="/tmp/confirmation.png")
-            log("Screenshot saved: /tmp/confirmation.png")
+                log("NOTE: submit button not located (would have failed at submit step)")
+            else:
+                btn_text = (submit_button.inner_text() or "").strip()
+                btn_aria = submit_button.get_attribute("aria-label") or ""
+                log(f"Submit button found but NOT clicked. text={btn_text!r} aria-label={btn_aria!r}")
+                submit_button.scroll_into_view_if_needed()
+                submit_button.evaluate("el => el.style.outline = '4px solid #ff3b3b'")
+            human_delay(2.0, 4.0)
+            shot = run_dir / "dry_run.png"
+            page.screenshot(path=str(shot))
+            log(f"Screenshot saved: {shot}")
             return 0
+
+            # --- Original submit/confirmation logic (re-enable to actually book) ---
+            # log("Submitting booking...")
+            # submit_button = _find_submit_button(page)
+            # if not submit_button:
+            #     log("ERROR: Could not find submit button")
+            #     page.screenshot(path=str(run_dir / "no_submit.png"))
+            #     return 1
+            #
+            # submit_button.click()
+            # log("Submit clicked, waiting for confirmation...")
+            #
+            # try:
+            #     page.wait_for_selector(
+            #         "text=confirmed, text=scheduled, text=You are scheduled",
+            #         timeout=15000,
+            #     )
+            #     log("SUCCESS: Booking confirmed!")
+            # except Exception:
+            #     human_delay(3.0, 5.0)
+            #     if "invitees" in page.url or "confirmed" in page.url.lower():
+            #         log("SUCCESS: Redirected to confirmation page")
+            #     else:
+            #         log(f"WARNING: Uncertain confirmation. Current URL: {page.url}")
+            #         page.screenshot(path=str(run_dir / "uncertain.png"))
+            #
+            # page.screenshot(path=str(run_dir / "confirmation.png"))
+            # log("Screenshot saved: confirmation.png")
+            # return 0
 
         except Exception as e:
             log(f"ERROR: {e}")
             try:
-                page.screenshot(path="/tmp/error.png")
-                log("Error screenshot saved: /tmp/error.png")
+                shot = run_dir / "error.png"
+                page.screenshot(path=str(shot))
+                log(f"Error screenshot saved: {shot}")
             except Exception:
                 pass
             return 1
