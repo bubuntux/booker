@@ -17,6 +17,7 @@
         ];
 
         shellHook = ''
+          unset SOURCE_DATE_EPOCH
           export PODMAN_USERNS=keep-id
           if [ ! -d .venv ]; then
             python -m venv .venv
