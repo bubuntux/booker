@@ -456,6 +456,55 @@ def run() -> int:
             browser.close()
 
 
+_MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+_MONTH_HEADER_RE = re.compile(
+    r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})"
+)
+
+
+def _read_current_month(page) -> tuple[int, int] | None:
+    """Return (year, month) shown in the calendar header, or None if unreadable.
+
+    Calendly puts the month label (e.g. 'May 2026') prominently in the
+    calendar; we just read the first match in the page text.
+    """
+    try:
+        body = page.evaluate("() => document.body.innerText")
+    except Exception:
+        return None
+    m = _MONTH_HEADER_RE.search(body or "")
+    if not m:
+        return None
+    return int(m.group(2)), _MONTH_NAMES.index(m.group(1)) + 1
+
+
+def _find_month_nav_button(page, direction: str):
+    """direction: 'next' or 'prev'. Returns a Locator or None."""
+    if direction == "next":
+        sels = [
+            'button[aria-label*="Go to next month" i]',
+            'button[aria-label*="Next month" i]',
+            'button[aria-label="Next"]',
+        ]
+    else:
+        sels = [
+            'button[aria-label*="Go to previous month" i]',
+            'button[aria-label*="Previous month" i]',
+            'button[aria-label="Previous"]',
+        ]
+    for sel in sels:
+        try:
+            cand = page.locator(sel).first
+            if cand.is_visible(timeout=500):
+                return cand
+        except Exception:
+            continue
+    return None
+
+
 def _wait_for_calendar_availability(page, timeout_ms: int = 12000) -> bool:
     """Wait for Calendly to finish loading the current month's availability.
 
@@ -474,35 +523,25 @@ def _wait_for_calendar_availability(page, timeout_ms: int = 12000) -> bool:
 
 
 def _navigate_to_month(page, target: date, max_clicks: int = 24) -> bool:
-    """Click 'next month' on the Calendly date picker until target's month is shown."""
+    """Move the Calendly date picker to target's month, going either direction."""
     target_label = target.strftime("%B %Y")  # e.g. "May 2026"
+    target_ym = (target.year, target.month)
     for _ in range(max_clicks):
-        try:
-            if page.get_by_text(target_label, exact=False).first.is_visible(timeout=1000):
-                # Header shows the right month — but availability may still be
-                # loading. Wait for it before letting the caller interact.
-                if not _wait_for_calendar_availability(page):
-                    log(f"  Availability did not load for {target_label}")
-                return True
-        except Exception:
-            pass
-        next_btn = None
-        for sel in (
-            'button[aria-label*="Go to next month" i]',
-            'button[aria-label*="Next month" i]',
-            'button[aria-label="Next"]',
-        ):
-            try:
-                cand = page.locator(sel).first
-                if cand.is_visible(timeout=500):
-                    next_btn = cand
-                    break
-            except Exception:
-                continue
-        if not next_btn:
-            log(f"  Could not find next-month control while seeking {target_label}")
+        current = _read_current_month(page)
+        if current is None:
+            log(f"  Could not read current month while navigating to {target_label}")
             return False
-        next_btn.click()
+        if current == target_ym:
+            if not _wait_for_calendar_availability(page):
+                log(f"  Availability did not load for {target_label}")
+            return True
+        direction = "next" if current < target_ym else "prev"
+        nav_btn = _find_month_nav_button(page, direction)
+        if not nav_btn:
+            log(f"  Could not find {direction}-month control while seeking {target_label}")
+            return False
+        log(f"  Clicking {direction}-month: currently {current}, want {target_ym}")
+        nav_btn.click()
         human_delay(0.4, 0.8)
     return False
 
@@ -558,7 +597,12 @@ def _click_day_cell(page, target: date) -> bool:
                 # If aria-label says "Times available" but button is disabled,
                 # something else is going on — skip with a hint.
                 if is_disabled:
-                    if "times available" in aria_label.lower() and not already_selected:
+                    label_lower = aria_label.lower()
+                    if (
+                        "times available" in label_lower
+                        and "no times available" not in label_lower
+                        and not already_selected
+                    ):
                         log(f"  Day reports times available but is disabled? aria-label={aria_label!r}")
                     continue
 
