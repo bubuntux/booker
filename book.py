@@ -120,6 +120,35 @@ def human_delay(lo: float = 0.3, hi: float = 1.0) -> None:
     time.sleep(random.uniform(lo, hi))
 
 
+def _prune_old_screenshots(root: Path, retention_days: int) -> None:
+    """Delete run dirs whose UTC-timestamp name is older than retention_days.
+
+    A non-positive retention_days disables pruning. Dirs whose names don't
+    parse as %Y%m%dT%H%M%SZ are left alone.
+    """
+    if retention_days <= 0 or not root.exists():
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    removed = 0
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            ts = datetime.strptime(child.name, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if ts < cutoff:
+            try:
+                for f in child.iterdir():
+                    f.unlink()
+                child.rmdir()
+                removed += 1
+            except OSError as e:
+                log(f"WARNING: Could not prune {child}: {e}")
+    if removed:
+        log(f"Pruned {removed} screenshot run(s) older than {retention_days} days")
+
+
 def _normalize(s: str) -> str:
     """Lowercase, drop required-marker `*`, collapse non-alphanumerics to single spaces."""
     return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
@@ -284,9 +313,15 @@ def run() -> int:
     except ValueError:
         log("WARNING: BOOKING_LOOKAHEAD_DAYS must be an integer; defaulting to 60")
         lookahead_days = 60
+    try:
+        retention_days = int(os.environ.get("SCREENSHOT_RETENTION_DAYS", "15"))
+    except ValueError:
+        log("WARNING: SCREENSHOT_RETENTION_DAYS must be an integer; defaulting to 15")
+        retention_days = 15
 
     run_dir = SCREENSHOT_ROOT / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir.mkdir(parents=True, exist_ok=True)
+    _prune_old_screenshots(SCREENSHOT_ROOT, retention_days)
 
     log(f"Booking URL: {booking_url}")
     log(f"Headless: {headless}")
