@@ -6,7 +6,7 @@ import random
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 SCREENSHOT_ROOT = Path(__file__).parent / "screenshots"
@@ -20,20 +20,100 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
-def collect_booking_fields() -> dict[str, str]:
-    """Collect all BOOKING_* env vars except BOOKING_URL.
+WEEKDAY_NAMES = [
+    "monday", "tuesday", "wednesday", "thursday",
+    "friday", "saturday", "sunday",
+]
 
-    Converts env var suffixes to lowercase label fragments:
+# BOOKING_* vars that configure the bot rather than supplying form-field values.
+NON_FIELD_BOOKING_VARS = {
+    "BOOKING_URL",
+    "BOOKING_LOOKAHEAD_DAYS",
+    "BOOKING_SKIP_DATES",
+}
+
+
+def collect_booking_fields() -> dict[str, str]:
+    """Collect BOOKING_* env vars that map to form fields.
+
+    Skips bot-config vars (BOOKING_URL, BOOKING_PREF_*, BOOKING_LOOKAHEAD_DAYS,
+    BOOKING_SKIP_DATES). Suffixes become lowercase label fragments:
         BOOKING_PHONE_NUMBER -> "phone number"
-        BOOKING_NAME         -> "name"
-        BOOKING_EMAIL        -> "email"
     """
     fields = {}
     for key, value in os.environ.items():
-        if key.startswith("BOOKING_") and key != "BOOKING_URL" and value:
-            label = key[len("BOOKING_"):].lower().replace("_", " ")
-            fields[label] = value
+        if not key.startswith("BOOKING_") or not value:
+            continue
+        if key in NON_FIELD_BOOKING_VARS or key.startswith("BOOKING_PREF_"):
+            continue
+        label = key[len("BOOKING_"):].lower().replace("_", " ")
+        fields[label] = value
     return fields
+
+
+def collect_time_preferences() -> dict[int, list[str]]:
+    """Read BOOKING_PREF_<WEEKDAY> env vars into {weekday_idx: ["HH:MM", ...]}.
+
+    Weekday index follows datetime.date.weekday(): 0 = Monday, 6 = Sunday.
+    Times are kept in the order given (= priority order).
+    """
+    prefs: dict[int, list[str]] = {}
+    for idx, name in enumerate(WEEKDAY_NAMES):
+        raw = os.environ.get(f"BOOKING_PREF_{name.upper()}", "").strip()
+        if not raw:
+            continue
+        times = [t.strip() for t in raw.split(",") if t.strip()]
+        if times:
+            prefs[idx] = times
+    return prefs
+
+
+def parse_skip_dates(raw: str) -> set[date]:
+    out: set[date] = set()
+    for piece in (raw or "").split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            out.add(date.fromisoformat(piece))
+        except ValueError:
+            log(f"WARNING: Ignoring invalid BOOKING_SKIP_DATES entry: {piece!r}")
+    return out
+
+
+def candidate_dates(
+    today: date, lookahead_days: int, weekday_idx: int, skip: set[date]
+) -> list[date]:
+    """Same-weekday dates from today+lookahead going backward to today (inclusive).
+
+    Furthest-out first (matches user's preference: lock the slot in early).
+    """
+    end = today + timedelta(days=lookahead_days)
+    delta = (end.weekday() - weekday_idx) % 7
+    cursor = end - timedelta(days=delta)
+    out: list[date] = []
+    while cursor >= today:
+        if cursor not in skip:
+            out.append(cursor)
+        cursor -= timedelta(days=7)
+    return out
+
+
+def time_to_calendly_strings(hhmm: str) -> list[str]:
+    """Map '07:00' / '18:30' to candidate Calendly button texts to match against."""
+    h, m = hhmm.split(":")
+    h_int = int(h)
+    m_int = int(m)
+    suffix_lower = "am" if h_int < 12 else "pm"
+    suffix_upper = suffix_lower.upper()
+    h12 = h_int % 12 or 12
+    return [
+        f"{h12}:{m_int:02d}{suffix_lower}",      # 7:00am
+        f"{h12}:{m_int:02d} {suffix_lower}",     # 7:00 am
+        f"{h12}:{m_int:02d}{suffix_upper}",      # 7:00AM
+        f"{h12}:{m_int:02d} {suffix_upper}",     # 7:00 AM
+        f"{h_int:02d}:{m_int:02d}",              # 07:00 (24h)
+    ]
 
 
 def human_delay(lo: float = 0.3, hi: float = 1.0) -> None:
@@ -196,6 +276,13 @@ def run() -> int:
 
     headless = os.environ.get("HEADLESS", "true").lower() != "false"
     fields = collect_booking_fields()
+    prefs = collect_time_preferences()
+    skip_dates = parse_skip_dates(os.environ.get("BOOKING_SKIP_DATES", ""))
+    try:
+        lookahead_days = int(os.environ.get("BOOKING_LOOKAHEAD_DAYS", "60"))
+    except ValueError:
+        log("WARNING: BOOKING_LOOKAHEAD_DAYS must be an integer; defaulting to 60")
+        lookahead_days = 60
 
     run_dir = SCREENSHOT_ROOT / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -203,11 +290,23 @@ def run() -> int:
     log(f"Booking URL: {booking_url}")
     log(f"Headless: {headless}")
     log(f"Fields to fill: {list(fields.keys())}")
+    log(f"Lookahead days: {lookahead_days}")
+    log(f"Skip dates: {sorted(skip_dates)}")
+    pref_summary = ", ".join(
+        f"{WEEKDAY_NAMES[k]}={v}" for k, v in sorted(prefs.items())
+    )
+    log(f"Time preferences: {pref_summary}")
     log(f"Screenshots: {run_dir}")
 
     if not fields:
         log("ERROR: No BOOKING_* form field env vars found (need at least BOOKING_NAME, BOOKING_EMAIL, etc.)")
         return 1
+    if not prefs:
+        log("ERROR: No BOOKING_PREF_<WEEKDAY> env vars set (e.g. BOOKING_PREF_MONDAY=07:00,07:30)")
+        return 1
+    if date.today().weekday() not in prefs:
+        log(f"INFO: No preferences for today ({WEEKDAY_NAMES[date.today().weekday()]}); nothing to book")
+        return 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -249,6 +348,18 @@ def run() -> int:
             page.screenshot(path=str(shot), full_page=True)
             log(f"Screenshot saved: {shot}")
 
+            log("Selecting date and time...")
+            picked = select_date_and_time(page, prefs, lookahead_days, skip_dates, run_dir)
+            if not picked:
+                log("ERROR: Could not find any matching date/time slot")
+                page.screenshot(path=str(run_dir / "no_slot.png"), full_page=True)
+                return 1
+            picked_date, picked_time = picked
+            log(f"Booked slot: {picked_date.isoformat()} {picked_time}")
+            shot = run_dir / "03_after_slot_selected.png"
+            page.screenshot(path=str(shot), full_page=True)
+            log(f"Screenshot saved: {shot}")
+
             # Wait for form fields to appear
             log("Waiting for booking form...")
             page.wait_for_selector(
@@ -260,7 +371,7 @@ def run() -> int:
             # Banner can appear late; retry once now that the form is present.
             _dismiss_cookie_banner(page, total_timeout_ms=2000)
 
-            shot = run_dir / "03_before_fill.png"
+            shot = run_dir / "04_before_fill.png"
             page.screenshot(path=str(shot), full_page=True)
             log(f"Screenshot saved: {shot}")
 
@@ -282,7 +393,7 @@ def run() -> int:
                 _debug_form_fields(page)
 
             human_delay(1.0, 2.0)
-            page.screenshot(path=str(run_dir / "04_after_fill.png"), full_page=True)
+            page.screenshot(path=str(run_dir / "05_after_fill.png"), full_page=True)
 
             # DRY RUN: submit disabled so you can verify field population.
             log("DRY RUN: skipping submit. Verify the filled form, then re-enable.")
@@ -296,7 +407,7 @@ def run() -> int:
                 submit_button.scroll_into_view_if_needed()
                 submit_button.evaluate("el => el.style.outline = '4px solid #ff3b3b'")
             human_delay(2.0, 4.0)
-            shot = run_dir / "05_dry_run.png"
+            shot = run_dir / "06_dry_run.png"
             page.screenshot(path=str(shot), full_page=True)
             log(f"Screenshot saved: {shot}")
             return 0
@@ -343,6 +454,259 @@ def run() -> int:
         finally:
             context.close()
             browser.close()
+
+
+def _navigate_to_month(page, target: date, max_clicks: int = 24) -> bool:
+    """Click 'next month' on the Calendly date picker until target's month is shown."""
+    target_label = target.strftime("%B %Y")  # e.g. "May 2026"
+    for _ in range(max_clicks):
+        try:
+            if page.get_by_text(target_label, exact=False).first.is_visible(timeout=1000):
+                return True
+        except Exception:
+            pass
+        next_btn = None
+        for sel in (
+            'button[aria-label*="Go to next month" i]',
+            'button[aria-label*="Next month" i]',
+            'button[aria-label="Next"]',
+        ):
+            try:
+                cand = page.locator(sel).first
+                if cand.is_visible(timeout=500):
+                    next_btn = cand
+                    break
+            except Exception:
+                continue
+        if not next_btn:
+            log(f"  Could not find next-month control while seeking {target_label}")
+            return False
+        next_btn.click()
+        human_delay(0.4, 0.8)
+    return False
+
+
+def _click_day_cell(page, target: date) -> bool:
+    """Click the calendar cell for `target`. Returns True iff the click landed.
+
+    Calendly's day cell can render as <button> (older) or <td role="gridcell">
+    with a <button> inside. The aria-label sometimes is "Friday, May 2",
+    sometimes "Friday, May 2, 2026", sometimes "Saturday, May 2 - Times available".
+    Try several patterns and fall back to dumping candidates for diagnostics.
+    """
+    long_date_no_year = target.strftime("%A, %B %-d")          # "Saturday, May 2"
+    long_date_with_year = target.strftime("%A, %B %-d, %Y")    # "Saturday, May 2, 2026"
+    iso = target.isoformat()                                    # "2026-05-02"
+    day_num = str(target.day)
+
+    selectors = [
+        f'button[aria-label*="{long_date_with_year}"]',
+        f'button[aria-label*="{long_date_no_year}"]',
+        f'[role="gridcell"] button[aria-label*="{long_date_no_year}"]',
+        f'button[data-date="{iso}"]',
+        f'[data-date="{iso}"] button',
+        # Last-resort: any button whose visible text is exactly the day number
+        # AND lives inside a [role="gridcell"]/td (so we don't grab unrelated UI).
+        f'[role="gridcell"] button:text-is("{day_num}")',
+        f'td button:text-is("{day_num}")',
+    ]
+
+    for sel in selectors:
+        try:
+            locator = page.locator(sel)
+            count = locator.count()
+        except Exception:
+            continue
+        for i in range(count):
+            btn = locator.nth(i)
+            try:
+                if not btn.is_visible(timeout=500):
+                    continue
+                aria_label = btn.get_attribute("aria-label") or ""
+                klass = btn.get_attribute("class") or ""
+                is_disabled = btn.get_attribute("aria-disabled") == "true" or btn.is_disabled()
+                already_selected = "selected" in klass.lower()
+
+                # Calendly disables the *currently selected* day to prevent
+                # re-clicking; treat that as success — the time pane is already
+                # showing slots for this date.
+                if is_disabled and already_selected:
+                    log(f"  Day already selected (matched {sel!r}); skipping click")
+                    return True
+
+                # If aria-label says "Times available" but button is disabled,
+                # something else is going on — skip with a hint.
+                if is_disabled:
+                    if "times available" in aria_label.lower() and not already_selected:
+                        log(f"  Day reports times available but is disabled? aria-label={aria_label!r}")
+                    continue
+
+                log(f"  Day cell matched via {sel!r}")
+                btn.click()
+                return True
+            except Exception:
+                continue
+
+    # Nothing matched — dump every visible day-like button so we can see what
+    # Calendly is actually rendering.
+    _debug_dump_calendar_buttons(page)
+    return False
+
+
+def _debug_dump_calendar_buttons(page) -> None:
+    """Log aria-label/text of likely day cells to help diagnose selector issues."""
+    log("  Dumping candidate day cells for diagnostics:")
+    locator = page.locator(
+        '[role="gridcell"] button, table button, [data-date] button, button[aria-label]'
+    )
+    try:
+        count = locator.count()
+    except Exception:
+        count = 0
+    seen = 0
+    for i in range(min(count, 80)):
+        btn = locator.nth(i)
+        try:
+            if not btn.is_visible(timeout=200):
+                continue
+            aria = btn.get_attribute("aria-label") or ""
+            data_date = btn.get_attribute("data-date") or ""
+            txt = (btn.inner_text() or "").strip().replace("\n", " ")
+            disabled = btn.get_attribute("aria-disabled") == "true" or btn.is_disabled()
+            if not (aria or data_date or txt):
+                continue
+            log(f"    text={txt!r} aria-label={aria!r} data-date={data_date!r} disabled={disabled}")
+            seen += 1
+            if seen >= 30:
+                break
+        except Exception:
+            continue
+    if seen == 0:
+        log("    (no day-like buttons visible on the page)")
+
+
+def _click_time_slot(page, hhmm: str) -> bool:
+    """Find a time-slot button matching hhmm in the right-hand pane and click it."""
+    for text in time_to_calendly_strings(hhmm):
+        try:
+            btn = page.get_by_role(
+                "button", name=re.compile(re.escape(text), re.IGNORECASE)
+            ).first
+            if btn.is_visible(timeout=1000):
+                btn.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _confirm_time_selection(page) -> bool:
+    """After picking a time, Calendly shows a 'Next' button to advance to the form."""
+    selectors = [
+        "button:has-text('Next')",
+        "button:has-text('Confirm')",
+        "button:has-text('Continue')",
+    ]
+    for selector in selectors:
+        try:
+            btn = page.locator(selector).first
+            if btn.is_visible(timeout=2000):
+                btn.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _shoot(page, run_dir: Path, name: str) -> None:
+    """Save a full-page screenshot with `name` (no extension)."""
+    path = run_dir / f"{name}.png"
+    try:
+        page.screenshot(path=str(path), full_page=True)
+        log(f"  Screenshot: {path.name}")
+    except Exception as e:
+        log(f"  Screenshot failed for {name}: {e}")
+
+
+def select_date_and_time(
+    page,
+    prefs: dict[int, list[str]],
+    lookahead_days: int,
+    skip_dates: set[date],
+    run_dir: Path,
+) -> tuple[date, str] | None:
+    """Walk same-weekday candidates furthest-first; book the first available match.
+
+    Returns (date, "HH:MM") on success, None if no slot was reachable. Captures
+    a screenshot at every meaningful step into run_dir for troubleshooting.
+    """
+    today = date.today()
+    weekday = today.weekday()
+    times = prefs.get(weekday)
+    if not times:
+        log(f"No BOOKING_PREF_{WEEKDAY_NAMES[weekday].upper()} set; nothing to do")
+        return None
+
+    candidates = candidate_dates(today, lookahead_days, weekday, skip_dates)
+    log(f"Candidate {WEEKDAY_NAMES[weekday]} dates (furthest first): "
+        f"{[d.isoformat() for d in candidates]}")
+    log(f"Time preferences: {times}")
+
+    _shoot(page, run_dir, "slot_00_initial_calendar")
+
+    for attempt_idx, d in enumerate(candidates, start=1):
+        tag = f"slot_{attempt_idx:02d}_{d.isoformat()}"
+        log(f"Trying {d.isoformat()}...")
+
+        if not _navigate_to_month(page, d):
+            _shoot(page, run_dir, f"{tag}_a_month_nav_failed")
+            continue
+        human_delay(0.3, 0.7)
+        _shoot(page, run_dir, f"{tag}_a_month_view")
+
+        if not _click_day_cell(page, d):
+            log(f"  {d.isoformat()} not selectable, skipping")
+            _shoot(page, run_dir, f"{tag}_b_day_not_selectable")
+            continue
+        _shoot(page, run_dir, f"{tag}_b_day_clicked")
+
+        # Wait for the time-slot pane to appear.
+        time_pane_loaded = False
+        try:
+            page.wait_for_selector(
+                "button[data-container='time-button'], button[data-start-time]",
+                timeout=8000,
+            )
+            time_pane_loaded = True
+        except Exception:
+            try:
+                page.wait_for_selector("button:has-text(':')", timeout=4000)
+                time_pane_loaded = True
+            except Exception:
+                pass
+        if not time_pane_loaded:
+            log("  Time slots didn't appear, skipping")
+            _shoot(page, run_dir, f"{tag}_c_no_time_pane")
+            continue
+        human_delay(0.4, 0.9)
+        _shoot(page, run_dir, f"{tag}_c_time_pane")
+
+        for t in times:
+            t_safe = t.replace(":", "")
+            if _click_time_slot(page, t):
+                log(f"  Selected {d.isoformat()} {t}")
+                _shoot(page, run_dir, f"{tag}_d_time_{t_safe}_clicked")
+                if _confirm_time_selection(page):
+                    log("  Confirmed; advancing to form")
+                    human_delay(0.5, 1.0)
+                    _shoot(page, run_dir, f"{tag}_e_time_{t_safe}_confirmed")
+                else:
+                    _shoot(page, run_dir, f"{tag}_e_time_{t_safe}_no_confirm_btn")
+                return d, t
+
+        log(f"  No matching time slot on {d.isoformat()}")
+        _shoot(page, run_dir, f"{tag}_d_no_time_match")
+    return None
 
 
 COOKIE_BUTTON_SELECTORS = [
