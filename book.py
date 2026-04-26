@@ -356,7 +356,7 @@ def run() -> int:
                 return 1
             picked_date, picked_time = picked
             log(f"Booked slot: {picked_date.isoformat()} {picked_time}")
-            shot = run_dir / "03_after_slot_selected.png"
+            shot = run_dir / "04_after_slot_selected.png"
             page.screenshot(path=str(shot), full_page=True)
             log(f"Screenshot saved: {shot}")
 
@@ -371,7 +371,7 @@ def run() -> int:
             # Banner can appear late; retry once now that the form is present.
             _dismiss_cookie_banner(page, total_timeout_ms=2000)
 
-            shot = run_dir / "04_before_fill.png"
+            shot = run_dir / "05_before_fill.png"
             page.screenshot(path=str(shot), full_page=True)
             log(f"Screenshot saved: {shot}")
 
@@ -393,7 +393,7 @@ def run() -> int:
                 _debug_form_fields(page)
 
             human_delay(1.0, 2.0)
-            page.screenshot(path=str(run_dir / "05_after_fill.png"), full_page=True)
+            page.screenshot(path=str(run_dir / "06_after_fill.png"), full_page=True)
 
             # DRY RUN: submit disabled so you can verify field population.
             log("DRY RUN: skipping submit. Verify the filled form, then re-enable.")
@@ -407,7 +407,7 @@ def run() -> int:
                 submit_button.scroll_into_view_if_needed()
                 submit_button.evaluate("el => el.style.outline = '4px solid #ff3b3b'")
             human_delay(2.0, 4.0)
-            shot = run_dir / "06_dry_run.png"
+            shot = run_dir / "07_dry_run.png"
             page.screenshot(path=str(shot), full_page=True)
             log(f"Screenshot saved: {shot}")
             return 0
@@ -456,12 +456,33 @@ def run() -> int:
             browser.close()
 
 
+def _wait_for_calendar_availability(page, timeout_ms: int = 12000) -> bool:
+    """Wait for Calendly to finish loading the current month's availability.
+
+    Returns True if at least one bookable day appeared, False on timeout.
+    Calendly shows a spinner while fetching availability and meanwhile every
+    day button reads "No times available", so interacting too early always
+    fails. We poll for any aria-label containing 'Times available'.
+    """
+    try:
+        page.wait_for_selector(
+            'button[aria-label*="Times available"]', timeout=timeout_ms
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _navigate_to_month(page, target: date, max_clicks: int = 24) -> bool:
     """Click 'next month' on the Calendly date picker until target's month is shown."""
     target_label = target.strftime("%B %Y")  # e.g. "May 2026"
     for _ in range(max_clicks):
         try:
             if page.get_by_text(target_label, exact=False).first.is_visible(timeout=1000):
+                # Header shows the right month — but availability may still be
+                # loading. Wait for it before letting the caller interact.
+                if not _wait_for_calendar_availability(page):
+                    log(f"  Availability did not load for {target_label}")
                 return True
         except Exception:
             pass
@@ -652,10 +673,16 @@ def select_date_and_time(
         f"{[d.isoformat() for d in candidates]}")
     log(f"Time preferences: {times}")
 
-    _shoot(page, run_dir, "slot_00_initial_calendar")
+    if _wait_for_calendar_availability(page, timeout_ms=15000):
+        log("Calendar availability loaded for the current month")
+    else:
+        log("WARNING: No 'Times available' day appeared within 15s on the "
+            "initial month view; will still try candidates")
+
+    _shoot(page, run_dir, "03_slot_00_initial_calendar")
 
     for attempt_idx, d in enumerate(candidates, start=1):
-        tag = f"slot_{attempt_idx:02d}_{d.isoformat()}"
+        tag = f"03_slot_{attempt_idx:02d}_{d.isoformat()}"
         log(f"Trying {d.isoformat()}...")
 
         if not _navigate_to_month(page, d):
