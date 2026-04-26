@@ -275,6 +275,7 @@ def run() -> int:
         return 1
 
     headless = os.environ.get("HEADLESS", "true").lower() != "false"
+    dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
     fields = collect_booking_fields()
     prefs = collect_time_preferences()
     skip_dates = parse_skip_dates(os.environ.get("BOOKING_SKIP_DATES", ""))
@@ -289,6 +290,7 @@ def run() -> int:
 
     log(f"Booking URL: {booking_url}")
     log(f"Headless: {headless}")
+    log(f"Dry run: {dry_run}")
     log(f"Fields to fill: {list(fields.keys())}")
     log(f"Lookahead days: {lookahead_days}")
     log(f"Skip dates: {sorted(skip_dates)}")
@@ -395,51 +397,43 @@ def run() -> int:
             human_delay(1.0, 2.0)
             page.screenshot(path=str(run_dir / "06_after_fill.png"), full_page=True)
 
-            # DRY RUN: submit disabled so you can verify field population.
-            log("DRY RUN: skipping submit. Verify the filled form, then re-enable.")
             submit_button = _find_submit_button(page)
             if not submit_button:
-                log("NOTE: submit button not located (would have failed at submit step)")
-            else:
-                btn_text = (submit_button.inner_text() or "").strip()
-                btn_aria = submit_button.get_attribute("aria-label") or ""
-                log(f"Submit button found but NOT clicked. text={btn_text!r} aria-label={btn_aria!r}")
+                log("ERROR: Could not find submit button")
+                page.screenshot(path=str(run_dir / "07_no_submit.png"), full_page=True)
+                return 1
+
+            btn_text = (submit_button.inner_text() or "").strip()
+            btn_aria = submit_button.get_attribute("aria-label") or ""
+            log(f"Submit button: text={btn_text!r} aria-label={btn_aria!r}")
+
+            if dry_run:
+                log("DRY_RUN=true: highlighting submit button without clicking")
                 submit_button.scroll_into_view_if_needed()
                 submit_button.evaluate("el => el.style.outline = '4px solid #ff3b3b'")
-            human_delay(2.0, 4.0)
-            shot = run_dir / "07_dry_run.png"
-            page.screenshot(path=str(shot), full_page=True)
-            log(f"Screenshot saved: {shot}")
-            return 0
+                human_delay(1.5, 2.5)
+                page.screenshot(path=str(run_dir / "07_dry_run.png"), full_page=True)
+                return 0
 
-            # --- Original submit/confirmation logic (re-enable to actually book) ---
-            # log("Submitting booking...")
-            # submit_button = _find_submit_button(page)
-            # if not submit_button:
-            #     log("ERROR: Could not find submit button")
-            #     page.screenshot(path=str(run_dir / "no_submit.png"))
-            #     return 1
-            #
-            # submit_button.click()
-            # log("Submit clicked, waiting for confirmation...")
-            #
-            # try:
-            #     page.wait_for_selector(
-            #         "text=confirmed, text=scheduled, text=You are scheduled",
-            #         timeout=15000,
-            #     )
-            #     log("SUCCESS: Booking confirmed!")
-            # except Exception:
-            #     human_delay(3.0, 5.0)
-            #     if "invitees" in page.url or "confirmed" in page.url.lower():
-            #         log("SUCCESS: Redirected to confirmation page")
-            #     else:
-            #         log(f"WARNING: Uncertain confirmation. Current URL: {page.url}")
-            #         page.screenshot(path=str(run_dir / "uncertain.png"))
-            #
-            # page.screenshot(path=str(run_dir / "confirmation.png"))
-            # log("Screenshot saved: confirmation.png")
-            # return 0
+            log("Submitting booking...")
+            submit_button.click()
+            log("Submit clicked, waiting for confirmation...")
+            try:
+                page.wait_for_selector(
+                    "text=confirmed, text=scheduled, text=You are scheduled",
+                    timeout=15000,
+                )
+                log("SUCCESS: Booking confirmed!")
+            except Exception:
+                human_delay(3.0, 5.0)
+                if "invitees" in page.url or "confirmed" in page.url.lower():
+                    log("SUCCESS: Redirected to confirmation page")
+                else:
+                    log(f"WARNING: Uncertain confirmation. Current URL: {page.url}")
+                    page.screenshot(path=str(run_dir / "07_uncertain.png"), full_page=True)
+            page.screenshot(path=str(run_dir / "08_confirmation.png"), full_page=True)
+            log("Screenshot saved: 08_confirmation.png")
+            return 0
 
         except Exception as e:
             log(f"ERROR: {e}")
