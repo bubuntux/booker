@@ -495,31 +495,60 @@ _MONTH_HEADER_RE = re.compile(
 
 
 def _read_current_month(page) -> tuple[int, int] | None:
-    """Return (year, month) shown in the calendar header, or None if unreadable.
+    """Return (year, month) shown in the calendar, or None if unreadable.
 
-    Calendly puts the month label (e.g. 'May 2026') prominently in the
-    calendar; we just read the first match in the page text.
+    Scans visible elements page-wide for one whose normalized innerText is
+    exactly 'Month YYYY'. Calendly's prev/next chevrons embed adjacent
+    month names in sr-only text (e.g. 'Previous Month, April 2026') — the
+    extra context means their innerText is never just 'Month YYYY', so
+    they're naturally excluded.
+    """
+    js = r"""
+        () => {
+            const exactRe = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})$/;
+            const all = document.querySelectorAll('h1, h2, h3, h4, h5, h6, span, div, p, [role="heading"]');
+            for (const el of all) {
+                if (el.offsetParent === null) continue;
+                const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+                if (t.length < 4 || t.length > 30) continue;
+                const m = t.match(exactRe);
+                if (m) return {month: m[1], year: m[2]};
+            }
+            return null;
+        }
     """
     try:
-        body = page.evaluate("() => document.body.innerText")
+        result = page.evaluate(js)
     except Exception:
         return None
-    m = _MONTH_HEADER_RE.search(body or "")
-    if not m:
+    if not result:
         return None
-    return int(m.group(2)), _MONTH_NAMES.index(m.group(1)) + 1
+    try:
+        return int(result["year"]), _MONTH_NAMES.index(result["month"]) + 1
+    except (ValueError, KeyError):
+        return None
 
 
 def _find_month_nav_button(page, direction: str):
-    """direction: 'next' or 'prev'. Returns a Locator or None."""
+    """direction: 'next' or 'prev'. Returns a Locator or None.
+
+    When the current month has no availability, Calendly overlays a
+    'View next month' / 'View previous month' CTA in the middle of the
+    calendar. Prefer those over the small chevrons because the chevrons
+    are sometimes disabled in that state.
+    """
     if direction == "next":
         sels = [
+            'button:has-text("View next month")',
+            'a:has-text("View next month")',
             'button[aria-label*="Go to next month" i]',
             'button[aria-label*="Next month" i]',
             'button[aria-label="Next"]',
         ]
     else:
         sels = [
+            'button:has-text("View previous month")',
+            'a:has-text("View previous month")',
             'button[aria-label*="Go to previous month" i]',
             'button[aria-label*="Previous month" i]',
             'button[aria-label="Previous"]',
@@ -568,6 +597,13 @@ def _navigate_to_month(page, target: date, max_clicks: int = 24) -> bool:
         nav_btn = _find_month_nav_button(page, direction)
         if not nav_btn:
             log(f"  Could not find {direction}-month control while seeking {target_label}")
+            return False
+        try:
+            disabled = nav_btn.is_disabled(timeout=500)
+        except Exception:
+            disabled = False
+        if disabled:
+            log(f"  {direction}-month control is disabled (likely past venue's booking horizon); cannot reach {target_label}")
             return False
         log(f"  Clicking {direction}-month: currently {current}, want {target_ym}")
         nav_btn.click()
